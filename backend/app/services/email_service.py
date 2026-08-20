@@ -1,6 +1,9 @@
 import smtplib
+import ssl
 import os
+import base64
 import logging
+import requests
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.application import MIMEApplication
@@ -118,20 +121,126 @@ def build_email_html_body(
 
 
 class EmailService:
-    """SMTP-based email service for delivering HR documents to employees."""
+    """Email delivery service supporting both Resend HTTPS API (cloud-safe) and standard SMTP."""
 
     def __init__(self):
+        self.resend_api_key: Optional[str] = getattr(settings, "RESEND_API_KEY", None)
         self.smtp_host: str = getattr(settings, "SMTP_HOST", "smtp.gmail.com")
         self.smtp_port: int = int(getattr(settings, "SMTP_PORT", 587))
         self.smtp_user: str = getattr(settings, "SMTP_USERNAME", "")
         self.smtp_password: str = getattr(settings, "SMTP_PASSWORD", "")
-        self.from_email: str = getattr(settings, "SMTP_FROM_EMAIL", self.smtp_user)
+        self.from_email: str = getattr(settings, "SMTP_FROM_EMAIL", self.smtp_user) or "onboarding@resend.dev"
         self.from_name: str = getattr(settings, "SMTP_FROM_NAME", "SmartSkale HR")
 
     @property
     def is_configured(self) -> bool:
-        """Returns True only if SMTP credentials are present."""
-        return bool(self.smtp_user and self.smtp_password)
+        """Returns True if either Resend API or SMTP credentials are configured."""
+        return bool(self.resend_api_key or (self.smtp_user and self.smtp_password))
+
+    def _send_via_resend(
+        self,
+        recipient_email: str,
+        subject: str,
+        html_body: str,
+        attachment_bytes: Optional[bytes] = None,
+        attachment_filename: str = "document.pdf",
+    ) -> dict:
+        """Send email via Resend HTTPS REST API (Port 443 - zero cloud firewall block)."""
+        try:
+            url = "https://api.resend.com/emails"
+            headers = {
+                "Authorization": f"Bearer {self.resend_api_key}",
+                "Content-Type": "application/json",
+            }
+            
+            # Format sender (default to onboarding@resend.dev if using default Resend test domain)
+            sender = f"{self.from_name} <{self.from_email}>"
+            if not self.from_email or "gmail" in self.from_email.lower():
+                sender = f"{self.from_name} <onboarding@resend.dev>"
+
+            payload = {
+                "from": sender,
+                "to": [recipient_email],
+                "subject": subject,
+                "html": html_body,
+            }
+
+            if attachment_bytes:
+                b64_content = base64.b64encode(attachment_bytes).decode("utf-8")
+                payload["attachments"] = [
+                    {
+                        "filename": attachment_filename,
+                        "content": b64_content,
+                    }
+                ]
+
+            resp = requests.post(url, json=payload, headers=headers, timeout=15)
+            if resp.status_code in (200, 201):
+                logger.info(f"Resend API email sent successfully to {recipient_email}")
+                return {"success": True, "message": f"Document emailed successfully to {recipient_email}."}
+            else:
+                err_json = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+                err_msg = err_json.get("message", resp.text)
+                logger.error(f"Resend API error: {resp.status_code} - {err_msg}")
+                return {"success": False, "message": f"Resend API error: {err_msg}"}
+        except Exception as e:
+            logger.error(f"Error calling Resend API: {e}")
+            return {"success": False, "message": f"Email API error: {str(e)}"}
+
+    def _send_via_smtp(
+        self,
+        recipient_email: str,
+        msg: MIMEMultipart,
+    ) -> dict:
+        """Send email via standard SMTP (handles Port 465 SSL and Port 587 STARTTLS)."""
+        try:
+            if self.smtp_port == 465:
+                # SSL direct connection
+                context = ssl.create_default_context()
+                with smtplib.SMTP_SSL(self.smtp_host, self.smtp_port, context=context, timeout=20) as server:
+                    server.login(self.smtp_user, self.smtp_password)
+                    server.sendmail(self.from_email, [recipient_email], msg.as_string())
+            else:
+                # STARTTLS connection (Port 587)
+                with smtplib.SMTP(self.smtp_host, self.smtp_port, timeout=20) as server:
+                    server.ehlo()
+                    server.starttls()
+                    server.ehlo()
+                    server.login(self.smtp_user, self.smtp_password)
+                    server.sendmail(self.from_email, [recipient_email], msg.as_string())
+
+            return {"success": True, "message": f"Document emailed successfully to {recipient_email}."}
+
+        except smtplib.SMTPAuthenticationError:
+            logger.error(f"SMTP authentication failed for {self.smtp_user}")
+            return {
+                "success": False,
+                "message": (
+                    "SMTP authentication failed. Verify SMTP_USERNAME and SMTP_PASSWORD "
+                    "(use a 16-character Google App Password, not your standard account password)."
+                ),
+            }
+        except smtplib.SMTPRecipientsRefused:
+            logger.error(f"Recipient email refused: {recipient_email}")
+            return {
+                "success": False,
+                "message": f"The recipient email address '{recipient_email}' was refused by the mail server.",
+            }
+        except (OSError, smtplib.SMTPException) as e:
+            logger.error(f"SMTP Network/Socket error while sending to {recipient_email}: {e}")
+            # Detect Render / cloud host SMTP port blocking
+            if "101" in str(e) or "unreachable" in str(e).lower() or "timed out" in str(e).lower():
+                return {
+                    "success": False,
+                    "message": (
+                        "Outbound SMTP network unreachable. Free cloud hosts (e.g. Render) block direct SMTP ports. "
+                        "Please add RESEND_API_KEY to your Render environment variables for HTTPS email delivery."
+                    ),
+                }
+            return {"success": False, "message": f"SMTP error: {str(e)}"}
+        except Exception as e:
+            logger.error(f"Unexpected error sending email: {e}")
+            return {"success": False, "message": f"Unexpected error: {str(e)}"}
 
     def send_document_email(
         self,
@@ -145,29 +254,13 @@ class EmailService:
         custom_message: Optional[str] = None,
         sender_display_name: Optional[str] = None,
     ) -> dict:
-        """
-        Send a generated PDF document to an employee via email.
-
-        Args:
-            recipient_email: The employee's email address.
-            recipient_name: The employee's full name.
-            document_type: Type of document (offer_letter, internship_certificate, etc.)
-            pdf_path: Path to the PDF file on disk (mutually exclusive with pdf_bytes).
-            pdf_bytes: Raw PDF bytes (used when file path not available).
-            pdf_filename: Filename for the PDF attachment.
-            subject: Optional custom email subject line.
-            custom_message: Optional personalized message to embed in email body.
-            sender_display_name: Overrides the default "SmartSkale HR Team" name.
-
-        Returns:
-            dict: {"success": bool, "message": str}
-        """
+        """Send a generated PDF document to an employee via email."""
         if not self.is_configured:
             return {
                 "success": False,
                 "message": (
-                    "Email service is not configured. Please set SMTP_USERNAME and "
-                    "SMTP_PASSWORD in your .env file. See .env.example for details."
+                    "Email service is not configured. Please set RESEND_API_KEY (recommended) or "
+                    "SMTP_USERNAME and SMTP_PASSWORD in your environment variables."
                 ),
             }
 
@@ -189,13 +282,7 @@ class EmailService:
             "letterhead": "Official SmartSkale Letter",
         }
         doc_label = doc_label_map.get(document_type, document_type.replace("_", " ").title())
-
-        # Build email message
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = subject or f"SmartSkale — Your {doc_label}"
-        msg["From"] = f"{sender_display_name or self.from_name} <{self.from_email}>"
-        msg["To"] = recipient_email
-        msg["Reply-To"] = self.from_email
+        email_subject = subject or f"SmartSkale — Your {doc_label}"
 
         # HTML body
         html_body = build_email_html_body(
@@ -204,56 +291,30 @@ class EmailService:
             sender_name=sender_display_name or self.from_name,
             custom_message=custom_message,
         )
-        msg.attach(MIMEText(html_body, "html"))
 
-        # PDF attachment
+        # 1. Prefer Resend API if API Key is available (Port 443 HTTPS - 100% reliable on Render/Cloud)
+        if self.resend_api_key:
+            return self._send_via_resend(
+                recipient_email=recipient_email,
+                subject=email_subject,
+                html_body=html_body,
+                attachment_bytes=attachment_bytes,
+                attachment_filename=pdf_filename,
+            )
+
+        # 2. Fallback to standard SMTP
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = email_subject
+        msg["From"] = f"{sender_display_name or self.from_name} <{self.from_email}>"
+        msg["To"] = recipient_email
+        msg["Reply-To"] = self.from_email
+
+        msg.attach(MIMEText(html_body, "html"))
         pdf_part = MIMEApplication(attachment_bytes, _subtype="pdf")
-        pdf_part.add_header(
-            "Content-Disposition",
-            "attachment",
-            filename=pdf_filename,
-        )
+        pdf_part.add_header("Content-Disposition", "attachment", filename=pdf_filename)
         msg.attach(pdf_part)
 
-        # Send via SMTP
-        try:
-            with smtplib.SMTP(self.smtp_host, self.smtp_port, timeout=30) as server:
-                server.ehlo()
-                server.starttls()
-                server.ehlo()
-                server.login(self.smtp_user, self.smtp_password)
-                server.sendmail(self.from_email, [recipient_email], msg.as_string())
-
-            logger.info(
-                f"Document email sent successfully to {recipient_email} "
-                f"(type={document_type}, file={pdf_filename})"
-            )
-            return {
-                "success": True,
-                "message": f"Document emailed successfully to {recipient_email}.",
-            }
-
-        except smtplib.SMTPAuthenticationError:
-            logger.error(f"SMTP authentication failed for {self.smtp_user}")
-            return {
-                "success": False,
-                "message": (
-                    "SMTP authentication failed. Please verify your SMTP_USERNAME and "
-                    "SMTP_PASSWORD (use an App Password for Gmail, not your account password)."
-                ),
-            }
-        except smtplib.SMTPRecipientsRefused:
-            logger.error(f"Recipient email refused: {recipient_email}")
-            return {
-                "success": False,
-                "message": f"The recipient email address '{recipient_email}' was refused by the mail server.",
-            }
-        except smtplib.SMTPException as e:
-            logger.error(f"SMTP error while sending to {recipient_email}: {e}")
-            return {"success": False, "message": f"SMTP error: {str(e)}"}
-        except Exception as e:
-            logger.error(f"Unexpected error sending email: {e}")
-            return {"success": False, "message": f"Unexpected error: {str(e)}"}
+        return self._send_via_smtp(recipient_email, msg)
 
     def send_otp_email(
         self,
@@ -264,23 +325,15 @@ class EmailService:
         """Send a password reset OTP verification code to a user."""
         if not self.is_configured:
             logger.warning(
-                f"[DEV MODE] SMTP not configured. OTP for {recipient_email} is: {otp_code}"
+                f"[DEV MODE] Email not configured. OTP for {recipient_email} is: {otp_code}"
             )
             return {
                 "success": True,
                 "dev_otp": otp_code,
-                "message": (
-                    f"Password reset code generated. (SMTP is not configured in .env, "
-                    f"so code is logged: {otp_code})"
-                ),
+                "message": f"Password reset code generated: {otp_code}",
             }
 
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = "SmartSkale — Password Reset Verification Code"
-        msg["From"] = f"{self.from_name} <{self.from_email}>"
-        msg["To"] = recipient_email
-        msg["Reply-To"] = self.from_email
-
+        subject = "SmartSkale — Password Reset Verification Code"
         html_body = f"""
 <!DOCTYPE html>
 <html lang="en">
@@ -335,21 +388,23 @@ class EmailService:
 </body>
 </html>
 """
+        # 1. Resend API
+        if self.resend_api_key:
+            return self._send_via_resend(
+                recipient_email=recipient_email,
+                subject=subject,
+                html_body=html_body,
+            )
+
+        # 2. SMTP
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = subject
+        msg["From"] = f"{self.from_name} <{self.from_email}>"
+        msg["To"] = recipient_email
+        msg["Reply-To"] = self.from_email
         msg.attach(MIMEText(html_body, "html"))
 
-        try:
-            with smtplib.SMTP(self.smtp_host, self.smtp_port, timeout=30) as server:
-                server.ehlo()
-                server.starttls()
-                server.ehlo()
-                server.login(self.smtp_user, self.smtp_password)
-                server.sendmail(self.from_email, [recipient_email], msg.as_string())
-
-            logger.info(f"Password reset OTP sent to {recipient_email}")
-            return {"success": True, "message": f"Verification code sent to {recipient_email}."}
-        except Exception as e:
-            logger.error(f"Failed to send OTP email: {e}")
-            return {"success": False, "message": f"Failed to send email: {str(e)}"}
+        return self._send_via_smtp(recipient_email, msg)
 
 
 email_service = EmailService()

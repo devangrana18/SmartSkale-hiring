@@ -26,14 +26,17 @@ class Settings(BaseSettings):
     # Frontend
     FRONTEND_URL: str = "http://localhost:5173"
     
-    # SMTP Email Settings (for document delivery)
-    # Gmail example: SMTP_HOST=smtp.gmail.com, SMTP_PORT=587
-    # Use an App Password (not your main Google account password) for Gmail
+    # Email Settings (Resend HTTP API or SMTP)
+    # Option A: Resend API (Recommended on Render / Cloud hosting - zero port blocking)
+    RESEND_API_KEY: Optional[str] = None
+
+    # Option B: Standard SMTP (Gmail, etc.)
+    # Gmail example: SMTP_HOST=smtp.gmail.com, SMTP_PORT=587 (or 465 for SSL)
     SMTP_HOST: str = "smtp.gmail.com"
     SMTP_PORT: int = 587
     SMTP_USERNAME: str = ""          # e.g. yourname@gmail.com
     SMTP_PASSWORD: str = ""          # Gmail App Password (16 chars, no spaces)
-    SMTP_FROM_EMAIL: str = ""        # Defaults to SMTP_USERNAME if empty
+    SMTP_FROM_EMAIL: str = ""        # Defaults to SMTP_USERNAME or onboarding@resend.dev
     SMTP_FROM_NAME: str = "SmartSkale HR"
 
     
