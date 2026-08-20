@@ -4,6 +4,7 @@ import pypdfium2 as pdfium
 
 sys.path.insert(0, os.path.abspath("backend"))
 
+# pyrefly: ignore [missing-import]
 from app.services.pdf_service import pdf_service
 
 offer_data = {
