@@ -121,9 +121,10 @@ def build_email_html_body(
 
 
 class EmailService:
-    """Email delivery service supporting both Resend HTTPS API (cloud-safe) and standard SMTP."""
+    """Email delivery service supporting Brevo API, Resend API (cloud-safe HTTPS), and standard SMTP."""
 
     def __init__(self):
+        self.brevo_api_key: Optional[str] = getattr(settings, "BREVO_API_KEY", None)
         self.resend_api_key: Optional[str] = getattr(settings, "RESEND_API_KEY", None)
         self.smtp_host: str = getattr(settings, "SMTP_HOST", "smtp.gmail.com")
         self.smtp_port: int = int(getattr(settings, "SMTP_PORT", 587))
@@ -134,8 +135,52 @@ class EmailService:
 
     @property
     def is_configured(self) -> bool:
-        """Returns True if either Resend API or SMTP credentials are configured."""
-        return bool(self.resend_api_key or (self.smtp_user and self.smtp_password))
+        """Returns True if Brevo API, Resend API, or SMTP credentials are configured."""
+        return bool(self.brevo_api_key or self.resend_api_key or (self.smtp_user and self.smtp_password))
+
+    def _send_via_brevo(
+        self,
+        recipient_email: str,
+        recipient_name: str,
+        subject: str,
+        html_body: str,
+        attachment_bytes: Optional[bytes] = None,
+        attachment_filename: str = "document.pdf",
+    ) -> dict:
+        """Send email via Brevo HTTPS REST API (Port 443 - no custom domain required, 300 free emails/day)."""
+        try:
+            url = "https://api.brevo.com/v3/smtp/email"
+            headers = {
+                "api-key": self.brevo_api_key,
+                "Content-Type": "application/json",
+            }
+            sender_email = self.from_email if ("@" in self.from_email and "resend" not in self.from_email) else "hr@smartskale.com"
+            payload = {
+                "sender": {"name": self.from_name, "email": sender_email},
+                "to": [{"email": recipient_email, "name": recipient_name}],
+                "subject": subject,
+                "htmlContent": html_body,
+            }
+            if attachment_bytes:
+                b64_content = base64.b64encode(attachment_bytes).decode("utf-8")
+                payload["attachment"] = [
+                    {
+                        "name": attachment_filename,
+                        "content": b64_content,
+                    }
+                ]
+            resp = requests.post(url, json=payload, headers=headers, timeout=15)
+            if resp.status_code in (200, 201):
+                logger.info(f"Brevo API email sent successfully to {recipient_email}")
+                return {"success": True, "message": f"Document emailed successfully to {recipient_email}."}
+            else:
+                err_json = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+                err_msg = err_json.get("message", resp.text)
+                logger.error(f"Brevo API error: {resp.status_code} - {err_msg}")
+                return {"success": False, "message": f"Brevo API error: {err_msg}"}
+        except Exception as e:
+            logger.error(f"Error calling Brevo API: {e}")
+            return {"success": False, "message": f"Email API error: {str(e)}"}
 
     def _send_via_resend(
         self,
@@ -292,7 +337,18 @@ class EmailService:
             custom_message=custom_message,
         )
 
-        # 1. Prefer Resend API if API Key is available (Port 443 HTTPS - 100% reliable on Render/Cloud)
+        # 1. Prefer Brevo API if set (Port 443 HTTPS - Sends to ANY email, no domain verification required)
+        if self.brevo_api_key:
+            return self._send_via_brevo(
+                recipient_email=recipient_email,
+                recipient_name=recipient_name,
+                subject=email_subject,
+                html_body=html_body,
+                attachment_bytes=attachment_bytes,
+                attachment_filename=pdf_filename,
+            )
+
+        # 2. Resend API (Port 443 HTTPS - requires domain verification for external recipients)
         if self.resend_api_key:
             return self._send_via_resend(
                 recipient_email=recipient_email,
@@ -302,7 +358,7 @@ class EmailService:
                 attachment_filename=pdf_filename,
             )
 
-        # 2. Fallback to standard SMTP
+        # 3. Fallback to standard SMTP
         msg = MIMEMultipart("alternative")
         msg["Subject"] = email_subject
         msg["From"] = f"{sender_display_name or self.from_name} <{self.from_email}>"
@@ -388,7 +444,16 @@ class EmailService:
 </body>
 </html>
 """
-        # 1. Resend API
+        # 1. Brevo API
+        if self.brevo_api_key:
+            return self._send_via_brevo(
+                recipient_email=recipient_email,
+                recipient_name=recipient_name,
+                subject=subject,
+                html_body=html_body,
+            )
+
+        # 2. Resend API
         if self.resend_api_key:
             return self._send_via_resend(
                 recipient_email=recipient_email,
@@ -396,7 +461,7 @@ class EmailService:
                 html_body=html_body,
             )
 
-        # 2. SMTP
+        # 3. SMTP
         msg = MIMEMultipart("alternative")
         msg["Subject"] = subject
         msg["From"] = f"{self.from_name} <{self.from_email}>"
