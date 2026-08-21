@@ -26,12 +26,11 @@ class Settings(BaseSettings):
     # Frontend
     FRONTEND_URL: str = "http://localhost:5173"
     
-    # Email Settings (Brevo API, Resend API, or SMTP)
-    # Option A: Brevo API (RECOMMENDED: 300 free emails/day to ANY recipient without requiring a custom domain)
-    BREVO_API_KEY: Optional[str] = None
-
-    # Option B: Resend API (Requires custom verified domain to send to external recipients)
+    # Option A: Resend API (Requires verified domain for external recipients)
     RESEND_API_KEY: Optional[str] = None
+
+    # Option B: Brevo API (100% Free, 300 emails/day, NO domain required - works with your Gmail address on Render)
+    BREVO_API_KEY: Optional[str] = None
 
     # Option B: Standard SMTP (Gmail, etc.)
     # Gmail example: SMTP_HOST=smtp.gmail.com, SMTP_PORT=587 (or 465 for SSL)
